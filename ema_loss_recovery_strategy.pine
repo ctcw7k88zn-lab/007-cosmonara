@@ -1,0 +1,265 @@
+//@version=6
+// Futures EMA crossover strategy with loss-recovery sizing and optional session controls.
+// Recommended: 15m+ charts, Risk 1–2%, RR 1.5–2.0, ES/MES SL 10–15 pts, NQ/MNQ SL 20–30 pts.
+strategy("Futures EMA Crossover (Loss Recovery)", overlay=true, initial_capital=100000, pyramiding=0, default_qty_type=strategy.fixed, default_qty_value=1, commission_type=strategy.commission.cash_per_contract, commission_value=0.0, slippage=0)
+
+// -----------------------
+// Contract settings
+// -----------------------
+contract          = input.string("ES", "Contract", options=["ES", "MES", "NQ", "MNQ"])
+fastLen           = input.int(9, "Fast EMA", minval=1)
+slowLen           = input.int(21, "Slow EMA", minval=1)
+
+// Risk settings
+riskPct           = input.float(1.0, "Default Risk %", minval=0.01, step=0.1)
+rrRatio           = input.float(1.5, "Risk : Reward", minval=0.1, step=0.05)
+lossRecoveryOn    = input.bool(true, "Loss Recovery")
+initialEquityIn   = input.float(100000, "Initial Capital (for risk calc)", minval=1000)
+useStrategyEquity = input.bool(true, "Use Strategy Equity", tooltip="When on, base risk uses live strategy equity. When off, uses the initial capital input.")
+
+// Stop-loss settings
+stopType          = input.string("ATR", "Stop Loss Type", options=["ATR", "Fixed Points", "Percentage"])
+fixedPointsSL     = input.float(12.0, "Fixed Points SL", minval=0.25, step=0.25)
+percentSL         = input.float(1.0, "% SL", minval=0.1, step=0.1)
+atrLen            = input.int(14, "ATR Length", minval=1)
+atrMult           = input.float(2.0, "ATR Multiplier", minval=0.1, step=0.1)
+
+// Session controls
+sessionStartEn    = input.bool(true, "Enable Session Start")
+sessionStartStr   = input.string("09:30", "Session Start (HH:MM ET)")
+sessionCloseEn    = input.bool(true, "Enable Session Close")
+sessionCloseStr   = input.string("16:00", "Session Close (HH:MM ET)")
+sessionTz         = input.string("America/New_York", "Time Zone")
+
+// -----------------------
+// Helpers
+// -----------------------
+getMultiplier(_c) =>
+    switch _c
+        "ES"  => 50.0
+        "MES" => 5.0
+        "NQ"  => 20.0
+        "MNQ" => 2.0
+        => 50.0
+
+getTick(_c) =>
+    // ES, MES, NQ, MNQ all use 0.25 point ticks on price
+    switch _c
+        "ES"  => 0.25
+        "MES" => 0.25
+        "NQ"  => 0.25
+        "MNQ" => 0.25
+        => 0.25
+
+roundToTick(_price, _tick) =>
+    math.round(_price / _tick) * _tick
+
+parseTimeStr(_txt) =>
+    parts = str.split(_txt, ":")
+    _h = parts.size() > 0 ? int(math.round(nz(str.tonumber(parts.get(0)), 0))) : 0
+    _m = parts.size() > 1 ? int(math.round(nz(str.tonumber(parts.get(1)), 0))) : 0
+    [_h, _m]
+
+// -----------------------
+// Contract values
+// -----------------------
+multiplier = getMultiplier(contract)
+tickSize   = getTick(contract)
+
+// -----------------------
+// Indicators
+// -----------------------
+fastEma = ta.ema(close, fastLen)
+slowEma = ta.ema(close, slowLen)
+atrVal  = ta.atr(atrLen)
+
+longSignal  = ta.crossover(fastEma, slowEma)
+shortSignal = ta.crossunder(fastEma, slowEma)
+
+// -----------------------
+// Session logic
+// -----------------------
+[startH, startM]   = parseTimeStr(sessionStartStr)
+[closeH, closeM]   = parseTimeStr(sessionCloseStr)
+curYear            = year(time, sessionTz)
+curMonth           = month(time, sessionTz)
+curDay             = dayofmonth(time, sessionTz)
+sessionStartTs     = timestamp(sessionTz, curYear, curMonth, curDay, startH, startM)
+sessionCloseTs     = timestamp(sessionTz, curYear, curMonth, curDay, closeH, closeM)
+
+sessionOpen = (not sessionStartEn or time >= sessionStartTs) and (not sessionCloseEn or time < sessionCloseTs)
+sessionLabel =
+     sessionCloseEn and time >= sessionCloseTs ? "Closed" :
+     sessionStartEn and time < sessionStartTs   ? "Pre-Open" : "Open"
+
+// Track day change using a midnight timestamp key in the session timezone
+curDateKey         = timestamp(sessionTz, curYear, curMonth, curDay, 0, 0)
+var int lastDateKey = na
+var bool closeDone  = false
+if na(lastDateKey) or curDateKey != lastDateKey
+    closeDone  := false
+    lastDateKey := curDateKey
+
+// -----------------------
+// Risk calculations
+// -----------------------
+var float lossStreakAmt = 0.0
+var int   lossCount     = 0
+var string lastRealTradeStatus = "None"
+var int   prevClosedTrades = 0
+var int   forceCloseBar      = na
+
+equity           = useStrategyEquity ? strategy.equity : initialEquityIn
+baseRisk         = equity * (riskPct / 100.0)
+stopPointsRaw    = switch stopType
+    "ATR"          => atrVal * atrMult
+    "Fixed Points" => fixedPointsSL
+    "Percentage"   => close * (percentSL / 100.0)
+    => atrVal * atrMult
+stopPoints       = math.max(stopPointsRaw, tickSize)
+tpPoints         = stopPoints * rrRatio
+riskPerContract  = stopPoints * multiplier
+effLossStreak    = lossRecoveryOn ? lossStreakAmt : 0.0
+currentRisk      = math.min(equity, baseRisk + effLossStreak)
+
+int contracts = currentRisk > 0 and riskPerContract > 0 ? int(math.max(1, math.floor(currentRisk / riskPerContract))) : 0
+positionRisk = riskPerContract * contracts
+
+// -----------------------
+// Force session close once/day
+// -----------------------
+forceCloseNow = sessionCloseEn and not closeDone and time >= sessionCloseTs
+if forceCloseNow
+    if strategy.position_size != 0
+        forceCloseBar := bar_index
+        strategy.close("Long", comment="Session Close")
+        strategy.close("Short", comment="Session Close")
+    closeDone := true
+
+// -----------------------
+// Manage trade exits and streak bookkeeping
+// -----------------------
+closedCount = strategy.closedtrades
+if closedCount > prevClosedTrades
+    for i = prevClosedTrades to closedCount - 1
+        profitValue = strategy.closedtrades.profit(i)
+        exitBarIdx  = strategy.closedtrades.exit_bar_index(i)
+        isForced    = not na(forceCloseBar) and exitBarIdx == forceCloseBar
+        if not isForced
+            if profitValue < 0
+                lossStreakAmt += -profitValue
+                lossCount     += 1
+                lastRealTradeStatus := "Loss"
+            else if profitValue > 0
+                lossStreakAmt := 0
+                lossCount     := 0
+                lastRealTradeStatus := "Win"
+            else
+                lastRealTradeStatus := "Flat"
+    prevClosedTrades := closedCount
+    forceCloseBar    := na
+
+// Reset trade-specific distances when flat
+var float activeStopPts = na
+var float activeTpPts   = na
+if strategy.position_size == 0
+    activeStopPts := na
+    activeTpPts   := na
+
+// -----------------------
+// Entry and exit logic
+// -----------------------
+canTrade = sessionOpen and contracts > 0 and riskPerContract > 0 and stopPoints > 0
+
+// Flip handling
+if longSignal and strategy.position_size < 0
+    strategy.close("Short", comment="Flip to Long")
+if shortSignal and strategy.position_size > 0
+    strategy.close("Long", comment="Flip to Short")
+
+// New entries
+if longSignal and canTrade
+    activeStopPts := stopPoints
+    activeTpPts   := tpPoints
+    strategy.entry("Long", strategy.long, qty=contracts)
+if shortSignal and canTrade
+    activeStopPts := stopPoints
+    activeTpPts   := tpPoints
+    strategy.entry("Short", strategy.short, qty=contracts)
+
+// Attach exits to open positions (keeps SL/TP locked per trade)
+if strategy.position_size > 0 and not na(activeStopPts) and not na(activeTpPts)
+    stopPrice  = roundToTick(strategy.position_avg_price - activeStopPts, tickSize)
+    limitPrice = roundToTick(strategy.position_avg_price + activeTpPts, tickSize)
+    strategy.exit("Long Exit", "Long", stop=stopPrice, limit=limitPrice, comment="SL/TP")
+if strategy.position_size < 0 and not na(activeStopPts) and not na(activeTpPts)
+    stopPrice  = roundToTick(strategy.position_avg_price + activeStopPts, tickSize)
+    limitPrice = roundToTick(strategy.position_avg_price - activeTpPts, tickSize)
+    strategy.exit("Short Exit", "Short", stop=stopPrice, limit=limitPrice, comment="SL/TP")
+
+// -----------------------
+// Plots and markers
+// -----------------------
+plot(fastEma, "Fast EMA", color=color.teal, linewidth=2)
+plot(slowEma, "Slow EMA", color=color.orange, linewidth=2)
+
+plotshape(longSignal and canTrade, title="Long Signal", style=shape.triangleup, location=location.belowbar, color=color.new(color.lime, 0), size=size.small, text="Buy")
+plotshape(shortSignal and canTrade, title="Short Signal", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0), size=size.small, text="Sell")
+
+longStopPlot  = strategy.position_size > 0 and not na(activeStopPts) ? roundToTick(strategy.position_avg_price - activeStopPts, tickSize) : na
+longTpPlot    = strategy.position_size > 0 and not na(activeTpPts)   ? roundToTick(strategy.position_avg_price + activeTpPts, tickSize) : na
+shortStopPlot = strategy.position_size < 0 and not na(activeStopPts) ? roundToTick(strategy.position_avg_price + activeStopPts, tickSize) : na
+shortTpPlot   = strategy.position_size < 0 and not na(activeTpPts)   ? roundToTick(strategy.position_avg_price - activeTpPts, tickSize) : na
+
+plot(longStopPlot, "Long SL", color=color.new(color.red, 0), style=plot.style_linebr)
+plot(longTpPlot, "Long TP", color=color.new(color.green, 0), style=plot.style_linebr)
+plot(shortStopPlot, "Short SL", color=color.new(color.red, 0), style=plot.style_linebr)
+plot(shortTpPlot, "Short TP", color=color.new(color.green, 0), style=plot.style_linebr)
+
+plotshape(forceCloseNow, title="Session Close", style=shape.xcross, location=location.abovebar, color=color.new(color.yellow, 0), size=size.tiny, text="Close")
+
+// -----------------------
+// Info table
+// -----------------------
+var table info = table.new(position.top_right, 2, 12, border_width=1)
+winRate = strategy.closedtrades > 0 ? (strategy.wintrades / strategy.closedtrades) * 100.0 : na
+posText = strategy.position_size > 0 ? "Long" : strategy.position_size < 0 ? "Short" : "Flat"
+lossInfo = lossRecoveryOn ? str.tostring(lossStreakAmt, format.mintick) : "Off"
+
+if barstate.islast
+    table.cell(info, 0, 0, "Contract", text_color=color.white, bgcolor=color.new(color.silver, 50))
+    table.cell(info, 1, 0, contract)
+
+    table.cell(info, 0, 1, "SL Type", text_color=color.white, bgcolor=color.new(color.silver, 50))
+    table.cell(info, 1, 1, stopType)
+
+    table.cell(info, 0, 2, "Loss Recovery", text_color=color.white, bgcolor=color.new(color.silver, 50))
+    table.cell(info, 1, 2, lossRecoveryOn ? "On" : "Off")
+
+    table.cell(info, 0, 3, "Current Risk", text_color=color.white, bgcolor=color.new(color.silver, 50))
+    table.cell(info, 1, 3, str.tostring(currentRisk, format.mintick))
+
+    table.cell(info, 0, 4, "Position", text_color=color.white, bgcolor=color.new(color.silver, 50))
+    table.cell(info, 1, 4, posText)
+
+    table.cell(info, 0, 5, "Risk / Contract", text_color=color.white, bgcolor=color.new(color.silver, 50))
+    table.cell(info, 1, 5, str.tostring(riskPerContract, format.mintick))
+
+    table.cell(info, 0, 6, "Contracts", text_color=color.white, bgcolor=color.new(color.silver, 50))
+    table.cell(info, 1, 6, contracts > 0 ? str.tostring(contracts) : "0")
+
+    table.cell(info, 0, 7, "Loss Streak", text_color=color.white, bgcolor=color.new(color.silver, 50))
+    table.cell(info, 1, 7, lossInfo)
+
+    table.cell(info, 0, 8, "Equity", text_color=color.white, bgcolor=color.new(color.silver, 50))
+    table.cell(info, 1, 8, str.tostring(equity, format.mintick))
+
+    table.cell(info, 0, 9, "Win Rate", text_color=color.white, bgcolor=color.new(color.silver, 50))
+    table.cell(info, 1, 9, na(winRate) ? "n/a" : str.tostring(winRate, format.percent))
+
+    table.cell(info, 0, 10, "Session", text_color=color.white, bgcolor=color.new(color.silver, 50))
+    table.cell(info, 1, 10, sessionLabel)
+
+    table.cell(info, 0, 11, "Last Real Trade", text_color=color.white, bgcolor=color.new(color.silver, 50))
+    table.cell(info, 1, 11, lastRealTradeStatus)
+
