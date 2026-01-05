@@ -14,6 +14,7 @@ slowLen           = input.int(21, "Slow EMA", minval=1)
 riskPct           = input.float(1.0, "Default Risk %", minval=0.01, step=0.1)
 rrRatio           = input.float(1.5, "Risk : Reward", minval=0.1, step=0.05)
 lossRecoveryOn    = input.bool(true, "Loss Recovery")
+useCustomInitial  = input.bool(true, "Use Custom Initial Capital", tooltip="When off, risk calc uses the strategy's built-in initial capital/equity.")
 initialEquityIn   = input.float(100000, "Initial Capital (for risk calc)", minval=1000)
 useStrategyEquity = input.bool(true, "Use Strategy Equity", tooltip="When on, base risk uses live strategy equity. When off, uses the initial capital input.")
 maxRiskPctCap     = input.float(5.0, "Max Risk % Cap", minval=0.1, step=0.1, tooltip="Ceiling on total risk % after loss recovery to avoid oversized orders.")
@@ -128,7 +129,8 @@ var string lastRealTradeStatus = "None"
 var int   prevClosedTrades = 0
 var int   forceCloseBar      = na
 
-equity           = useStrategyEquity ? strategy.equity : initialEquityIn
+equityBase       = useCustomInitial ? initialEquityIn : strategy.initial_capital
+equity           = useStrategyEquity ? strategy.equity : equityBase
 baseRisk         = equity * (riskPct / 100.0)
 stopPointsRaw    = switch stopType
     "ATR"          => atrVal * atrMult
