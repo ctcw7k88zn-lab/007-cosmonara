@@ -27,17 +27,16 @@ percentSL         = input.float(1.0, "% SL", minval=0.1, step=0.1)
 atrLen            = input.int(14, "ATR Length", minval=1)
 atrMult           = input.float(2.0, "ATR Multiplier", minval=0.1, step=0.1)
 
-// Session controls
-sessionPreset     = input.string("Physical (09:30-16:00 ET)", "Session Preset", options=["Physical (09:30-16:00 ET)", "Electronic (24h)", "Custom"])
+// Session controls (custom window) and daily pause (no-trade block)
 sessionStartEn    = input.bool(true, "Enable Session Start")
 sessionStartStr   = input.string("09:30", "Session Start (HH:MM ET)")
 sessionCloseEn    = input.bool(true, "Enable Session Close")
 sessionCloseStr   = input.string("16:00", "Session Close (HH:MM ET)")
 sessionTz         = input.string("America/New_York", "Time Zone")
-// Maintenance (daily non-trading window, e.g., CME daily halt)
-maintenanceEn       = input.bool(true, "Enable Maintenance Halt")
-maintenanceStartStr = input.string("17:00", "Maintenance Start (HH:MM ET)")
-maintenanceEndStr   = input.string("18:00", "Maintenance End (HH:MM ET)")
+// Daily pause window (e.g., no trading 16:00–18:00)
+pauseEn           = input.bool(true, "Enable Daily Pause")
+pauseStartStr     = input.string("16:00", "Pause Start (HH:MM ET)")
+pauseEndStr       = input.string("18:00", "Pause End (HH:MM ET)")
 
 // -----------------------
 // Helpers
@@ -87,37 +86,33 @@ shortSignal = ta.crossunder(fastEma, slowEma)
 // -----------------------
 // Session logic
 // -----------------------
-[startH, startM]        = parseTimeStr(sessionPreset == "Physical (09:30-16:00 ET)" ? "09:30" : sessionPreset == "Electronic (24h)" ? "00:00" : sessionStartStr)
-[closeH, closeM]        = parseTimeStr(sessionPreset == "Physical (09:30-16:00 ET)" ? "16:00" : sessionPreset == "Electronic (24h)" ? "23:59" : sessionCloseStr)
-[maintStartH, maintStartM] = parseTimeStr(maintenanceStartStr)
-[maintEndH, maintEndM]     = parseTimeStr(maintenanceEndStr)
+[startH, startM]        = parseTimeStr(sessionStartStr)
+[closeH, closeM]        = parseTimeStr(sessionCloseStr)
+[pauseStartH, pauseStartM] = parseTimeStr(pauseStartStr)
+[pauseEndH, pauseEndM]     = parseTimeStr(pauseEndStr)
 curYear            = year(time, sessionTz)
 curMonth           = month(time, sessionTz)
 curDay             = dayofmonth(time, sessionTz)
-sessionStartTs     = timestamp(sessionTz, curYear, curMonth, curDay, startH, startM)
-sessionCloseTs     = timestamp(sessionTz, curYear, curMonth, curDay, closeH, closeM)
-maintenanceStartTs = timestamp(sessionTz, curYear, curMonth, curDay, maintStartH, maintStartM)
-maintenanceEndTs   = timestamp(sessionTz, curYear, curMonth, curDay, maintEndH, maintEndM)
+sessionStartTs    = timestamp(sessionTz, curYear, curMonth, curDay, startH, startM)
+sessionCloseTs    = timestamp(sessionTz, curYear, curMonth, curDay, closeH, closeM)
+pauseStartTs      = timestamp(sessionTz, curYear, curMonth, curDay, pauseStartH, pauseStartM)
+pauseEndTs        = timestamp(sessionTz, curYear, curMonth, curDay, pauseEndH, pauseEndM)
 
-effectiveStartEn = sessionPreset == "Electronic (24h)" ? false : sessionStartEn
-effectiveCloseEn = sessionPreset == "Electronic (24h)" ? false : sessionCloseEn
-
-maintenanceWindow = maintenanceEn and time >= maintenanceStartTs and time < maintenanceEndTs
-sessionOpen = (not effectiveStartEn or time >= sessionStartTs) and (not effectiveCloseEn or time < sessionCloseTs) and not maintenanceWindow
+pauseWindow = pauseEn and time >= pauseStartTs and time < pauseEndTs
+sessionOpen = (not sessionStartEn or time >= sessionStartTs) and (not sessionCloseEn or time < sessionCloseTs) and not pauseWindow
 sessionLabel =
-     maintenanceWindow                            ? "Maintenance" :
-     sessionPreset == "Electronic (24h)"          ? "24h" :
-     effectiveCloseEn and time >= sessionCloseTs  ? "Closed" :
-     effectiveStartEn and time < sessionStartTs   ? "Pre-Open" : "Open"
+     pauseWindow                        ? "Paused" :
+     sessionCloseEn and time >= sessionCloseTs ? "Closed" :
+     sessionStartEn and time < sessionStartTs  ? "Pre-Open" : "Open"
 
 // Track day change using a midnight timestamp key in the session timezone
 curDateKey         = timestamp(sessionTz, curYear, curMonth, curDay, 0, 0)
 var int lastDateKey = na
 var bool closeDone  = false
-var bool maintenanceCloseDone = false
+var bool pauseCloseDone = false
 if na(lastDateKey) or curDateKey != lastDateKey
     closeDone            := false
-    maintenanceCloseDone := false
+    pauseCloseDone := false
     lastDateKey          := curDateKey
 
 // -----------------------
@@ -150,18 +145,18 @@ contracts        = math.min(contractsRaw, maxContracts)
 positionRisk = riskPerContract * contracts
 
 // -----------------------
-// Force closes: maintenance window and session close
+// Force closes: daily pause window and session close
 // -----------------------
-forceCloseNowMaint   = maintenanceWindow and not maintenanceCloseDone
-forceCloseNowSession = effectiveCloseEn and not closeDone and time >= sessionCloseTs
-forceCloseAny        = forceCloseNowMaint or forceCloseNowSession
+forceCloseNowPause   = pauseWindow and not pauseCloseDone
+forceCloseNowSession = sessionCloseEn and not closeDone and time >= sessionCloseTs
+forceCloseAny        = forceCloseNowPause or forceCloseNowSession
 
-if forceCloseNowMaint
+if forceCloseNowPause
     if strategy.position_size != 0
         forceCloseBar := bar_index
-        strategy.close("Long", comment="Maintenance Close")
-        strategy.close("Short", comment="Maintenance Close")
-    maintenanceCloseDone := true
+        strategy.close("Long", comment="Pause Close")
+        strategy.close("Short", comment="Pause Close")
+    pauseCloseDone := true
 
 if forceCloseNowSession
     if strategy.position_size != 0
